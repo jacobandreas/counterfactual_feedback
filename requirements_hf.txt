@@ -1,0 +1,21 @@
+# Requirements for HuggingFace fine-tuning script (finetune_hf.py)
+# Install with: pip install -r requirements_hf.txt
+
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.10.0
+accelerate>=0.20.0
+
+# Optional: LoRA fine-tuning (recommended for efficiency)
+peft>=0.4.0
+
+# Optional: Weights & Biases logging
+wandb>=0.15.0
+
+# Optional: Flash Attention for efficiency (if supported by your hardware)
+# flash-attn>=2.0.0
+
+# General dependencies
+numpy>=1.21.0
+tqdm>=4.64.0
