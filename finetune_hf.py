@@ -248,6 +248,14 @@ class HFFineTuner:
         train_dataset = Dataset.from_list(train_data)
         val_dataset = Dataset.from_list(val_data)
         
+        # Debug: print sample data structure
+        if len(train_data) > 0:
+            sample = train_data[0]
+            print(f"Sample data structure:")
+            print(f"  input_ids type: {type(sample['input_ids'])}, length: {len(sample['input_ids'])}")
+            print(f"  attention_mask type: {type(sample['attention_mask'])}, length: {len(sample['attention_mask'])}")
+            print(f"  labels type: {type(sample['labels'])}, length: {len(sample['labels'])}")
+        
         return train_dataset, val_dataset
     
     def create_trainer(self, train_dataset: Dataset, val_dataset: Dataset, 
@@ -277,7 +285,8 @@ class HFFineTuner:
         data_collator = DataCollatorForLanguageModeling(
             tokenizer=self.tokenizer,
             mlm=False,  # Causal LM, not masked LM
-            pad_to_multiple_of=8
+            pad_to_multiple_of=8,
+            return_tensors="pt"
         )
         
         # Create trainer
@@ -285,10 +294,10 @@ class HFFineTuner:
             model=self.model,
             args=training_arguments,
             train_dataset=train_dataset,
-            eval_dataset=val_dataset,
+            eval_dataset=val_dataset if len(val_dataset) > 0 else None,
             data_collator=data_collator,
             tokenizer=self.tokenizer,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)] if val_dataset else None
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)] if len(val_dataset) > 0 else None
         )
         
         return trainer
