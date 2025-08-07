@@ -484,7 +484,7 @@ def main():
         'logging_steps': args.logging_steps,
         'save_steps': args.save_steps,
         'eval_steps': args.eval_steps,
-        'evaluation_strategy': 'steps' if len(val_dataset) > 0 else 'no',
+        'eval_strategy': 'steps' if len(val_dataset) > 0 else 'no',
         'save_strategy': 'steps',
         'load_best_model_at_end': True if len(val_dataset) > 0 else False,
         'metric_for_best_model': 'eval_loss' if len(val_dataset) > 0 else None,
