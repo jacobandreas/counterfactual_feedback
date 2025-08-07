@@ -31,6 +31,8 @@ from transformers import (
 from datasets import Dataset
 import torch
 from torch.utils.data import DataLoader
+from dataclasses import dataclass
+from typing import Dict, List
 
 # Optional imports
 try:
@@ -44,6 +46,55 @@ try:
     PEFT_AVAILABLE = True
 except ImportError:
     PEFT_AVAILABLE = False
+
+@dataclass
+class CustomDataCollator:
+    """
+    Custom data collator for conversation fine-tuning.
+    Handles padding and batching of input_ids, attention_mask, and labels.
+    """
+    tokenizer: Any
+    pad_to_multiple_of: int = 8
+    
+    def __call__(self, features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+        # Find the maximum length in the batch
+        max_length = max(len(f['input_ids']) for f in features)
+        
+        # Pad to multiple if specified
+        if self.pad_to_multiple_of is not None:
+            max_length = ((max_length + self.pad_to_multiple_of - 1) // self.pad_to_multiple_of) * self.pad_to_multiple_of
+        
+        batch = {
+            'input_ids': [],
+            'attention_mask': [],
+            'labels': []
+        }
+        
+        for feature in features:
+            input_ids = feature['input_ids']
+            attention_mask = feature['attention_mask']
+            labels = feature['labels']
+            
+            # Calculate padding needed
+            padding_length = max_length - len(input_ids)
+            
+            # Pad input_ids and attention_mask with pad_token_id and 0 respectively
+            padded_input_ids = input_ids + [self.tokenizer.pad_token_id] * padding_length
+            padded_attention_mask = attention_mask + [0] * padding_length
+            
+            # Pad labels with -100 (ignore_index)
+            padded_labels = labels + [-100] * padding_length
+            
+            batch['input_ids'].append(padded_input_ids)
+            batch['attention_mask'].append(padded_attention_mask)
+            batch['labels'].append(padded_labels)
+        
+        # Convert to tensors
+        return {
+            'input_ids': torch.tensor(batch['input_ids'], dtype=torch.long),
+            'attention_mask': torch.tensor(batch['attention_mask'], dtype=torch.long),
+            'labels': torch.tensor(batch['labels'], dtype=torch.long)
+        }
 
 class HFFineTuner:
     """Handles fine-tuning of HuggingFace models."""
@@ -281,12 +332,10 @@ class HFFineTuner:
             **training_args
         )
         
-        # Data collator
-        data_collator = DataCollatorForLanguageModeling(
+        # Custom data collator
+        data_collator = CustomDataCollator(
             tokenizer=self.tokenizer,
-            mlm=False,  # Causal LM, not masked LM
-            pad_to_multiple_of=8,
-            return_tensors="pt"
+            pad_to_multiple_of=8
         )
         
         # Create trainer
