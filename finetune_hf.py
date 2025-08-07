@@ -164,52 +164,68 @@ class HFFineTuner:
                     self.stats['skipped_conversations'] += 1
                     continue
                 
-                # Build the conversation text
-                conversation_text = ""
+                # Build the conversation text up to but not including the last assistant response
+                context_text = ""
+                target_text = ""
+                
                 for i, turn in enumerate(conversation_context):
                     role = turn['role']
                     content = turn['content']
                     
-                    if role == 'user':
-                        conversation_text += f"<|user|>\n{content}\n\n"
-                    elif role == 'assistant':
-                        conversation_text += f"<|assistant|>\n{content}\n\n"
+                    if i < last_assistant_idx:
+                        # This is context (will be masked)
+                        if role == 'user':
+                            context_text += f"<|user|>\n{content}\n\n"
+                        elif role == 'assistant':
+                            context_text += f"<|assistant|>\n{content}\n\n"
+                    elif i == last_assistant_idx:
+                        # This is the target assistant response (will be trained on)
+                        context_text += f"<|assistant|>\n"
+                        target_text = f"{content}\n\n"
                 
-                # Tokenize the conversation
-                tokens = self.tokenizer(
-                    conversation_text,
+                # Combine context and target
+                full_text = context_text + target_text
+                
+                # Tokenize the full conversation
+                full_tokens = self.tokenizer(
+                    full_text,
                     truncation=True,
                     max_length=max_length,
                     padding=False,
                     return_tensors=None
                 )
                 
-                # Create labels for training (mask everything except the last assistant response)
-                labels = tokens['input_ids'].copy()
-                
-                # Find the start of the last assistant response in tokens
-                last_assistant_text = f"<|assistant|>\n{conversation_context[last_assistant_idx]['content']}\n\n"
-                last_assistant_tokens = self.tokenizer(
-                    last_assistant_text,
-                    add_special_tokens=False,
+                # Tokenize just the context to find where target starts
+                context_tokens = self.tokenizer(
+                    context_text,
+                    truncation=False,
+                    padding=False,
                     return_tensors=None
-                )['input_ids']
+                )
                 
-                # Mask all tokens except the last assistant response
-                for i in range(len(labels)):
-                    # Simple approach: only train on the last part of the sequence
-                    # More sophisticated masking could be implemented here
-                    if i < len(labels) - len(last_assistant_tokens):
-                        labels[i] = -100  # Ignore in loss computation
+                # Create labels - mask context, keep target
+                labels = [-100] * len(full_tokens['input_ids'])
+                context_length = len(context_tokens['input_ids'])
+                
+                # Only train on the target tokens (after context)
+                if context_length < len(full_tokens['input_ids']):
+                    for i in range(context_length, len(full_tokens['input_ids'])):
+                        labels[i] = full_tokens['input_ids'][i]
+                
+                # Skip if no target tokens to train on
+                training_token_count = len([l for l in labels if l != -100])
+                if training_token_count == 0:
+                    self.stats['skipped_conversations'] += 1
+                    continue
                 
                 if is_training:
-                    self.stats['training_tokens'] += len([l for l in labels if l != -100])
+                    self.stats['training_tokens'] += training_token_count
                 
-                self.stats['total_tokens'] += len(tokens['input_ids'])
+                self.stats['total_tokens'] += len(full_tokens['input_ids'])
                 
                 processed_data.append({
-                    'input_ids': tokens['input_ids'],
-                    'attention_mask': tokens['attention_mask'],
+                    'input_ids': full_tokens['input_ids'],
+                    'attention_mask': full_tokens['attention_mask'],
                     'labels': labels
                 })
                 
@@ -484,7 +500,7 @@ def main():
         'logging_steps': args.logging_steps,
         'save_steps': args.save_steps,
         'eval_steps': args.eval_steps,
-        'eval_strategy': 'steps' if len(val_dataset) > 0 else 'no',
+        'evaluation_strategy': 'steps' if len(val_dataset) > 0 else 'no',
         'save_strategy': 'steps',
         'load_best_model_at_end': True if len(val_dataset) > 0 else False,
         'metric_for_best_model': 'eval_loss' if len(val_dataset) > 0 else None,
