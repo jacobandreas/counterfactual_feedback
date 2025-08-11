@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluation script for comparing models using LM-as-judge paradigm.
+Evaluation script for comparing models using LM-as-judge paradigm with support for HuggingFace and Together API models.
 
 This script supports two modes:
 
@@ -16,12 +16,27 @@ This script supports two modes:
    - Uses a judge model to determine which response is better
    - Skips entries missing original_assistant_response
 
+Model Specifications:
+   - HuggingFace models: Use "hf:" prefix, e.g., "hf:meta-llama/Llama-2-7b-chat-hf"
+   - Together API models: Use "together:" prefix, e.g., "together:meta-llama/Llama-2-7b-chat-hf"
+   - For backward compatibility, models without prefix default to Together API
+
 Usage:
-    # Model comparison mode
-    python evaluate.py compare --model1 model_name_1 --model2 model_name_2 --judge judge_model_name
+    # Model comparison mode with HuggingFace models
+    python evaluate.py compare --model1 hf:meta-llama/Llama-2-7b-chat-hf --model2 hf:meta-llama/Llama-2-13b-chat-hf --judge together:meta-llama/Llama-2-70b-chat-hf
     
-    # Feedback dataset evaluation mode  
-    python evaluate.py feedback --dataset data/feedback_10k_8b.json --judge judge_model_name
+    # Model comparison mode with Together API models
+    python evaluate.py compare --model1 together:meta-llama/Llama-2-7b-chat-hf --model2 together:meta-llama/Llama-2-13b-chat-hf --judge together:meta-llama/Llama-2-70b-chat-hf
+    
+    # Feedback dataset evaluation mode with HuggingFace judge
+    python evaluate.py feedback --dataset data/feedback_10k_8b.json --judge hf:meta-llama/Llama-2-70b-chat-hf
+    
+    # Mixed setup (HF model vs Together model, judged by Together)
+    python evaluate.py compare --model1 hf:meta-llama/Llama-2-7b-chat-hf --model2 together:meta-llama/Llama-2-13b-chat-hf --judge together:meta-llama/Llama-2-70b-chat-hf
+
+Requirements:
+    - For Together API: Set TOGETHER_API_KEY environment variable
+    - For HuggingFace models: Install transformers and torch (pip install transformers torch)
 """
 
 import json
@@ -34,18 +49,31 @@ from typing import List, Dict, Any, Tuple, Optional
 from together import Together
 import math
 
+# Optional HuggingFace imports
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import torch
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
 class ModelEvaluator:
-    """Handles model evaluation using LM-as-judge paradigm."""
+    """Handles model evaluation using LM-as-judge paradigm with support for Together API and HuggingFace models."""
     
     def __init__(self, api_key: Optional[str] = None):
-        """Initialize the evaluator with Together API."""
+        """Initialize the evaluator with Together API and HuggingFace support."""
+        # Together API setup
         if api_key is None:
             api_key = os.getenv('TOGETHER_API_KEY')
         
-        if not api_key:
-            raise ValueError("Together API key is required. Set TOGETHER_API_KEY environment variable.")
+        self.together_client = None
+        if api_key:
+            self.together_client = Together(api_key=api_key)
         
-        self.client = Together(api_key=api_key)
+        # HuggingFace models cache
+        self.hf_models = {}  # Cache for loaded HF models
+        self.hf_tokenizers = {}  # Cache for loaded HF tokenizers
+        
         self.results = {
             'model1_wins': 0,
             'model2_wins': 0,
@@ -54,6 +82,161 @@ class ModelEvaluator:
             'total_evaluations': 0,
             'evaluations': []
         }
+    
+    def parse_model_name(self, model_spec: str) -> Tuple[str, str]:
+        """
+        Parse model specification into source and model name.
+        
+        Args:
+            model_spec: Model specification like "hf:meta-llama/Llama-2-7b-chat-hf" or "together:meta-llama/Llama-2-7b-chat-hf"
+            
+        Returns:
+            Tuple of (source, model_name)
+        """
+        if ':' in model_spec:
+            source, model_name = model_spec.split(':', 1)
+            return source.lower(), model_name
+        else:
+            # Default to together for backward compatibility
+            return 'together', model_spec
+    
+    def load_hf_model(self, model_name: str) -> Tuple[Any, Any]:
+        """
+        Load HuggingFace model and tokenizer with caching.
+        
+        Args:
+            model_name: HuggingFace model name
+            
+        Returns:
+            Tuple of (model, tokenizer)
+        """
+        if not HF_AVAILABLE:
+            raise ValueError("HuggingFace transformers not available. Install with: pip install transformers torch")
+        
+        if model_name not in self.hf_models:
+            print(f"Loading HuggingFace model: {model_name}")
+            
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.is_available() else None,
+                trust_remote_code=True
+            )
+            
+            self.hf_models[model_name] = model
+            self.hf_tokenizers[model_name] = tokenizer
+            print(f"Loaded HuggingFace model: {model_name}")
+        
+        return self.hf_models[model_name], self.hf_tokenizers[model_name]
+    
+    def generate_hf_response(self, model_name: str, context: List[Dict[str, str]], max_retries: int = 3) -> Optional[str]:
+        """
+        Generate a response using a HuggingFace model.
+        
+        Args:
+            model_name: HuggingFace model name
+            context: Conversation context (list of messages)
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Generated response or None if failed
+        """
+        try:
+            model, tokenizer = self.load_hf_model(model_name)
+            
+            # Convert context to text format
+            conversation_text = ""
+            for turn in context:
+                role = turn['role']
+                content = turn['content']
+                if role == 'user':
+                    conversation_text += f"<|user|>\n{content}\n\n"
+                elif role == 'assistant':
+                    conversation_text += f"<|assistant|>\n{content}\n\n"
+            
+            # Add the assistant prompt for response generation
+            conversation_text += "<|assistant|>\n"
+            
+            # Tokenize input
+            inputs = tokenizer(
+                conversation_text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048
+            )
+            
+            # Move to device if using GPU
+            if torch.cuda.is_available():
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            
+            # Generate response
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+            
+            # Decode response
+            response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+            response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+            
+            return response.strip() if response else None
+            
+        except Exception as e:
+            print(f"Error generating HuggingFace response with {model_name}: {e}")
+            return None
+    
+    def generate_together_response(self, model_name: str, context: List[Dict[str, str]], max_retries: int = 3) -> Optional[str]:
+        """
+        Generate a response using Together API.
+        
+        Args:
+            model_name: Together model name
+            context: Conversation context (list of messages)
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Generated response or None if failed
+        """
+        if not self.together_client:
+            print("Together API client not available. Set TOGETHER_API_KEY environment variable.")
+            return None
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.together_client.chat.completions.create(
+                    model=model_name,
+                    messages=context,
+                    max_tokens=512,
+                    temperature=0.7,
+                    top_p=0.9,
+                    repetition_penalty=1.0
+                )
+                
+                # Extract content from response with safe access
+                try:
+                    content = response.choices[0].message.content  # type: ignore
+                    if content:
+                        return str(content).strip()
+                except (AttributeError, IndexError, TypeError):
+                    pass
+                
+                return None
+            except Exception as e:
+                print(f"Error generating Together response with {model_name} (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    return None
+        return None
     
     def load_test_set(self, path: str = "data/filtered_conversations.json", limit: int = 1000) -> List[Dict[str, Any]]:
         """Load conversations for evaluation testing.
@@ -190,45 +373,27 @@ class ModelEvaluator:
             return context[-2].get('content', '')
         return ""
     
-    def generate_model_response(self, model_name: str, context: List[Dict[str, str]], max_retries: int = 3) -> Optional[str]:
+    def generate_model_response(self, model_spec: str, context: List[Dict[str, str]], max_retries: int = 3) -> Optional[str]:
         """
         Generate a response from the specified model given the conversation context.
         
         Args:
-            model_name: Name of the model to use
+            model_spec: Model specification (e.g., "hf:meta-llama/Llama-2-7b-chat-hf" or "together:meta-llama/Llama-2-7b-chat-hf")
             context: Conversation context (list of messages)
             max_retries: Maximum number of retry attempts
             
         Returns:
             Generated response or None if failed
         """
-        for attempt in range(max_retries):
-            try:
-                response = self.client.chat.completions.create(
-                    model=model_name,
-                    messages=context,
-                    max_tokens=512,
-                    temperature=0.7,
-                    top_p=0.9,
-                    repetition_penalty=1.0
-                )
-                
-                # Extract content from response with safe access
-                try:
-                    content = response.choices[0].message.content  # type: ignore
-                    if content:
-                        return str(content).strip()
-                except (AttributeError, IndexError, TypeError):
-                    pass
-                
-                return None
-            except Exception as e:
-                print(f"Error generating response with {model_name} (attempt {attempt + 1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    return None
-        return None
+        source, model_name = self.parse_model_name(model_spec)
+        
+        if source == 'hf':
+            return self.generate_hf_response(model_name, context, max_retries)
+        elif source == 'together':
+            return self.generate_together_response(model_name, context, max_retries)
+        else:
+            print(f"Unknown model source: {source}. Use 'hf:' or 'together:' prefix.")
+            return None
     
     def create_judge_prompt(self, context: List[Dict[str, str]], response1: str, response2: str, original: str) -> List[Dict[str, str]]:
         """
@@ -265,14 +430,14 @@ class ModelEvaluator:
 
         return [{"role": "user", "content": judge_prompt}]
     
-    def judge_responses(self, judge_model: str, context: List[Dict[str, str]], 
+    def judge_responses(self, judge_model_spec: str, context: List[Dict[str, str]], 
                        response1: str, response2: str, original: str, 
                        max_retries: int = 3) -> Optional[str]:
         """
         Use the judge model to compare two responses.
         
         Args:
-            judge_model: Name of the judge model
+            judge_model_spec: Judge model specification (e.g., "hf:..." or "together:...")
             context: Conversation context
             response1: Response from model 1
             response2: Response from model 2
@@ -284,35 +449,28 @@ class ModelEvaluator:
         """
         judge_messages = self.create_judge_prompt(context, response1, response2, original)
         
+        # Use the unified response generation for the judge
         for attempt in range(max_retries):
             try:
-                response = self.client.chat.completions.create(
-                    model=judge_model,
-                    messages=judge_messages,
-                    max_tokens=100,
-                    temperature=0.1,  # Lower temperature for more consistent judging
-                    repetition_penalty=1.0
-                )
+                # Generate judgment using the unified method
+                response_content = self.generate_model_response(judge_model_spec, judge_messages, max_retries=1)
                 
-                # Extract and parse judgment with safe access
-                try:
-                    content = response.choices[0].message.content  # type: ignore
-                    if content:
-                        judgment = str(content).strip().upper()
-                        
-                        # Parse the judgment
-                        if "[[A]]" in judgment and "[[B]]" not in judgment:
-                            return "A"
-                        elif "[[B]]" in judgment and "[[A]]" not in judgment:
-                            return "B"
-                        elif "[[TIE]]" in judgment:
-                            return "TIE"
-                        else:
-                            print(f"Ambiguous judgment: {judgment}")
-                            if attempt == max_retries - 1:
-                                return None
-                except (AttributeError, IndexError, TypeError):
-                    pass
+                if response_content:
+                    judgment = str(response_content).strip().upper()
+                    
+                    # Parse the judgment
+                    if "[[A]]" in judgment and "[[B]]" not in judgment:
+                        return "A"
+                    elif "[[B]]" in judgment and "[[A]]" not in judgment:
+                        return "B"
+                    elif "[[TIE]]" in judgment:
+                        return "TIE"
+                    else:
+                        print(f"Ambiguous judgment: {judgment}")
+                        if attempt == max_retries - 1:
+                            return None
+                else:
+                    print(f"No response from judge model (attempt {attempt + 1})")
                     
             except Exception as e:
                 print(f"Error getting judgment (attempt {attempt + 1}): {e}")
@@ -847,11 +1005,11 @@ def main():
     # Model comparison mode (original functionality)
     model_parser = subparsers.add_parser('compare', help='Compare two models')
     model_parser.add_argument('--model1', '-m1', required=True,
-                             help='First model to evaluate')
+                             help='First model to evaluate (e.g., hf:meta-llama/Llama-2-7b-chat-hf or together:meta-llama/Llama-2-7b-chat-hf)')
     model_parser.add_argument('--model2', '-m2', required=True,
-                             help='Second model to evaluate')
+                             help='Second model to evaluate (e.g., hf:meta-llama/Llama-2-13b-chat-hf or together:meta-llama/Llama-2-13b-chat-hf)')
     model_parser.add_argument('--judge', '-j', required=True,
-                             help='Judge model for comparison')
+                             help='Judge model for comparison (e.g., hf:meta-llama/Llama-2-70b-chat-hf or together:meta-llama/Llama-2-70b-chat-hf)')
     model_parser.add_argument('--conversations', '-c', 
                              default='data/filtered_conversations.json',
                              help='Path to conversations file (default: data/filtered_conversations.json)')
@@ -867,7 +1025,7 @@ def main():
     feedback_parser.add_argument('--dataset', '-d', required=True,
                                 help='Path to feedback dataset file (e.g., data/feedback_10k_8b.json)')
     feedback_parser.add_argument('--judge', '-j', required=True,
-                                help='Judge model for comparison')
+                                help='Judge model for comparison (e.g., hf:meta-llama/Llama-2-70b-chat-hf or together:meta-llama/Llama-2-70b-chat-hf)')
     feedback_parser.add_argument('--limit', '-l', type=int,
                                 help='Maximum number of conversations to evaluate (optional)')
     feedback_parser.add_argument('--delay', type=float, default=0.5,
@@ -883,10 +1041,41 @@ def main():
         print("\nError: Please specify evaluation mode (compare or feedback)")
         return 1
     
-    # Check API key
-    if not os.getenv('TOGETHER_API_KEY'):
-        print("Error: TOGETHER_API_KEY environment variable not set.")
+    # Check if Together API models are being used and warn if API key is missing
+    def uses_together_api(models_to_check):
+        for model in models_to_check:
+            if model:
+                source, _ = evaluator_temp.parse_model_name(model)
+                if source == 'together':
+                    return True
+        return False
+    
+    # Create a temporary evaluator to access parse_model_name
+    evaluator_temp = ModelEvaluator()
+    
+    models_to_check = []
+    if args.mode == 'compare':
+        models_to_check = [args.model1, args.model2, args.judge]
+    elif args.mode == 'feedback':
+        models_to_check = [args.judge]
+    
+    if uses_together_api(models_to_check) and not os.getenv('TOGETHER_API_KEY'):
+        print("Warning: Using Together API models but TOGETHER_API_KEY environment variable not set.")
         print("Please set it with: export TOGETHER_API_KEY='your-api-key-here'")
+        print("Together API models will fail without the API key.")
+    
+    # Check HuggingFace availability if needed
+    def uses_huggingface(models_to_check):
+        for model in models_to_check:
+            if model:
+                source, _ = evaluator_temp.parse_model_name(model)
+                if source == 'hf':
+                    return True
+        return False
+    
+    if uses_huggingface(models_to_check) and not HF_AVAILABLE:
+        print("Error: Using HuggingFace models but transformers/torch not available.")
+        print("Please install with: pip install transformers torch")
         return 1
     
     # Create results directory

@@ -1,0 +1,18 @@
+# Requirements for HuggingFace model support in evaluate.py
+# Install with: pip install -r requirements_evaluate_hf.txt
+
+# Core HuggingFace dependencies
+transformers>=4.30.0
+torch>=2.0.0
+accelerate>=0.20.0
+
+# Optional: For better performance
+# flash-attn>=2.0.0  # Uncomment if your hardware supports it
+
+# Existing dependencies (should already be installed)
+together>=1.0.0
+scipy>=1.10.0  # For statistical tests
+
+# General dependencies
+numpy>=1.21.0
+tqdm>=4.64.0
