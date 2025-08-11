@@ -2,14 +2,26 @@
 """
 Evaluation script for comparing models using LM-as-judge paradigm.
 
-This script:
-1. Takes the last 1000 conversations from data/conversations.json as test set
-2. Generates responses from two test models for each conversation context
-3. Uses a judge model to compare the responses and pick the winner
-4. Computes statistics and saves results to JSON
+This script supports two modes:
+
+1. Model Comparison (original functionality):
+   - Takes the last N conversations from data/conversations.json as test set
+   - Generates responses from two test models for each conversation context
+   - Uses a judge model to compare the responses and pick the winner
+   - Computes statistics and saves results to JSON
+
+2. Feedback Dataset Evaluation (new functionality):
+   - Takes a feedback dataset file (e.g., data/feedback_10k_8b.json)
+   - Compares the last assistant turn in conversation_context vs original_assistant_response
+   - Uses a judge model to determine which response is better
+   - Skips entries missing original_assistant_response
 
 Usage:
-    python evaluate.py --model1 model_name_1 --model2 model_name_2 --judge judge_model_name
+    # Model comparison mode
+    python evaluate.py compare --model1 model_name_1 --model2 model_name_2 --judge judge_model_name
+    
+    # Feedback dataset evaluation mode  
+    python evaluate.py feedback --dataset data/feedback_10k_8b.json --judge judge_model_name
 """
 
 import json
@@ -75,6 +87,36 @@ class ModelEvaluator:
         print(f"Found {len(valid_conversations)} valid conversations (with assistant responses followed by user feedback)")
         return valid_conversations
     
+    def load_feedback_dataset(self, path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Load feedback dataset for comparing current vs original responses.
+        
+        Args:
+            path: Path to feedback dataset file
+            limit: Maximum number of conversations to load (optional)
+        """
+        
+        print(f"Loading feedback dataset from {path}...")
+        with open(path, 'r', encoding='utf-8') as f:
+            all_conversations = json.load(f)
+        
+        # Limit if specified
+        if limit:
+            all_conversations = all_conversations[:limit]
+        
+        print(f"Loaded {len(all_conversations)} conversations from feedback dataset")
+        
+        # Filter to only use conversations that have original_assistant_response
+        valid_conversations = []
+        for conv in all_conversations:
+            if 'original_assistant_response' in conv and conv['original_assistant_response']:
+                context = conv.get('conversation_context', [])
+                # Make sure the conversation context has at least one turn and ends with assistant
+                if len(context) >= 1 and context[-1].get('role') == 'assistant':
+                    valid_conversations.append(conv)
+        
+        print(f"Found {len(valid_conversations)} valid conversations with original responses to compare")
+        return valid_conversations
+    
     def prepare_conversation_context(self, conversation: Dict[str, Any]) -> List[Dict[str, str]]:
         """
         Prepare conversation context by removing the last two turns (assistant response + user feedback).
@@ -103,6 +145,42 @@ class ModelEvaluator:
             })
         
         return prepared_context
+    
+    def prepare_feedback_conversation_context(self, conversation: Dict[str, Any]) -> List[Dict[str, str]]:
+        """
+        Prepare conversation context from feedback dataset by removing the last assistant turn.
+        
+        Args:
+            conversation: Conversation dictionary from feedback dataset
+            
+        Returns:
+            List of messages without the last assistant response
+        """
+        context = conversation.get('conversation_context', [])
+        
+        # Remove the last turn (assistant response) to get the context for comparison
+        if len(context) >= 1 and context[-1].get('role') == 'assistant':
+            context_without_last = context[:-1]
+        else:
+            context_without_last = context
+        
+        # Convert to the expected format
+        prepared_context = []
+        for turn in context_without_last:
+            prepared_context.append({
+                'role': turn.get('role', ''),
+                'content': turn.get('content', '')
+            })
+        
+        return prepared_context
+    
+    def get_current_response(self, conversation: Dict[str, Any]) -> str:
+        """Get the current assistant response from the feedback dataset (last turn)."""
+        context = conversation.get('conversation_context', [])
+        # The current assistant response should be the last turn
+        if len(context) >= 1 and context[-1].get('role') == 'assistant':
+            return context[-1].get('content', '')
+        return ""
     
     def get_original_response(self, conversation: Dict[str, Any]) -> str:
         """Get the original assistant response from the conversation (second-to-last turn)."""
@@ -179,7 +257,7 @@ class ModelEvaluator:
     "comparing the responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
     "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
     "of the assistants. Be as objective as possible. After providing your explanation, output your final verdict by strictly following this format: "
-    '"[[A]]" if assistant A is best, "[[B]]" if assistant B is best, or "[[TIE]]" if both assistants are equally good.\n'
+    '"[[A]]" if assistant A is best, "[[B]]" if assistant B is best, or "[[TIE]]" if both assistants are equally good. Your response should be no longer than about 50 words.\n'
     f"\nConversation Context:\n{context_text}\n"
     f"Response A: {response1}\n"
     f"Response B: {response2}\n"
@@ -211,7 +289,7 @@ class ModelEvaluator:
                 response = self.client.chat.completions.create(
                     model=judge_model,
                     messages=judge_messages,
-                    max_tokens=10,
+                    max_tokens=100,
                     temperature=0.1,  # Lower temperature for more consistent judging
                     repetition_penalty=1.0
                 )
@@ -223,11 +301,11 @@ class ModelEvaluator:
                         judgment = str(content).strip().upper()
                         
                         # Parse the judgment
-                        if "A" in judgment and "B" not in judgment:
+                        if "[[A]]" in judgment and "[[B]]" not in judgment:
                             return "A"
-                        elif "B" in judgment and "A" not in judgment:
+                        elif "[[B]]" in judgment and "[[A]]" not in judgment:
                             return "B"
-                        elif "TIE" in judgment:
+                        elif "[[TIE]]" in judgment:
                             return "TIE"
                         else:
                             print(f"Ambiguous judgment: {judgment}")
@@ -340,6 +418,93 @@ class ModelEvaluator:
             'order': order
         }
     
+    def evaluate_feedback_conversation(self, conversation: Dict[str, Any], judge_model: str, conv_idx: int) -> Dict[str, Any]:
+        """
+        Evaluate a single conversation from feedback dataset by comparing current vs original response.
+        
+        Args:
+            conversation: Conversation from feedback dataset
+            judge_model: Name of judge model
+            conv_idx: Index of conversation for logging
+            
+        Returns:
+            Evaluation result dictionary
+        """
+        print(f"Evaluating feedback conversation {conv_idx + 1}...")
+        
+        # Get the context (without the current assistant response)
+        context = self.prepare_feedback_conversation_context(conversation)
+        current_response = self.get_current_response(conversation)
+        original_response = conversation.get('original_assistant_response', '')
+        
+        if not context:
+            return {
+                'conversation_id': conversation.get('conversation_id', f'conv_{conv_idx}'),
+                'status': 'error',
+                'error': 'Empty context after removing current assistant response'
+            }
+        
+        if not current_response:
+            return {
+                'conversation_id': conversation.get('conversation_id', f'conv_{conv_idx}'),
+                'status': 'error',
+                'error': 'No current assistant response found'
+            }
+        
+        if not original_response:
+            return {
+                'conversation_id': conversation.get('conversation_id', f'conv_{conv_idx}'),
+                'status': 'error',
+                'error': 'No original assistant response found'
+            }
+        
+        # Randomize order for fair judging
+        if random.random() < 0.5:
+            # Current as A, Original as B
+            judgment = self.judge_responses(judge_model, context, current_response, original_response, "")
+            order = "normal"  # Current=A, Original=B
+        else:
+            # Original as A, Current as B (reversed)
+            judgment = self.judge_responses(judge_model, context, original_response, current_response, "")
+            order = "reversed"  # Original=A, Current=B
+        
+        if judgment is None:
+            return {
+                'conversation_id': conversation.get('conversation_id', f'conv_{conv_idx}'),
+                'status': 'error',
+                'error': 'Failed to get judgment from judge model'
+            }
+        
+        # Convert judgment based on order
+        if order == "reversed":
+            if judgment == "A":
+                judgment = "B"  # Original won, but we want Current perspective
+            elif judgment == "B":
+                judgment = "A"  # Current won
+            # TIE remains TIE
+        
+        # Map judgment to winner (from perspective of current vs original)
+        if judgment == "A":
+            winner = "current"  # Current response won
+        elif judgment == "B":
+            winner = "original"  # Original response won
+        else:  # TIE
+            winner = "tie"
+        
+        return {
+            'conversation_id': conversation.get('conversation_id', f'conv_{conv_idx}'),
+            'status': 'success',
+            'context': context,
+            'current_response': current_response,
+            'original_response': original_response,
+            'judgment': judgment,
+            'winner': winner,
+            'order': order,
+            'model': conversation.get('model', 'unknown'),
+            'category': conversation.get('category', 'unknown'),
+            'label': conversation.get('label', None)
+        }
+    
     def run_evaluation(self, test_conversations: List[Dict[str, Any]], 
                       model1: str, model2: str, judge_model: str,
                       delay: float = 0.5) -> Dict[str, Any]:
@@ -417,6 +582,146 @@ class ModelEvaluator:
             },
             'statistics': stats,
             'evaluations': self.results['evaluations']
+        }
+        
+        return final_results
+    
+    def run_feedback_evaluation(self, test_conversations: List[Dict[str, Any]], 
+                               judge_model: str, delay: float = 0.5) -> Dict[str, Any]:
+        """
+        Run evaluation on feedback dataset comparing current vs original responses.
+        
+        Args:
+            test_conversations: List of conversations from feedback dataset
+            judge_model: Name of judge model
+            delay: Delay between API calls
+            
+        Returns:
+            Complete evaluation results
+        """
+        print(f"\nStarting feedback evaluation...")
+        print(f"Judge model: {judge_model}")
+        print(f"Total conversations: {len(test_conversations)}")
+        
+        results = []
+        
+        for i, conversation in enumerate(test_conversations):
+            result = self.evaluate_feedback_conversation(conversation, judge_model, i)
+            results.append(result)
+            
+            # Add delay between requests
+            if i < len(test_conversations) - 1:
+                time.sleep(delay)
+        
+        # Calculate summary statistics
+        feedback_results = {
+            'current_wins': 0,
+            'original_wins': 0,
+            'ties': 0,
+            'errors': 0,
+            'total_evaluations': len(results)
+        }
+        
+        for result in results:
+            if result['status'] == 'success':
+                winner = result['winner']
+                if winner == 'current':
+                    feedback_results['current_wins'] += 1
+                elif winner == 'original':
+                    feedback_results['original_wins'] += 1
+                elif winner == 'tie':
+                    feedback_results['ties'] += 1
+            else:
+                feedback_results['errors'] += 1
+        
+        successful_evaluations = feedback_results['total_evaluations'] - feedback_results['errors']
+        success_rate = successful_evaluations / feedback_results['total_evaluations'] if feedback_results['total_evaluations'] > 0 else 0
+        
+        print(f"\nFeedback Evaluation Summary:")
+        print(f"  Total evaluations: {feedback_results['total_evaluations']}")
+        print(f"  Successful: {successful_evaluations} ({success_rate:.1%})")
+        print(f"  Errors: {feedback_results['errors']}")
+        print(f"  Current response wins: {feedback_results['current_wins']}")
+        print(f"  Original response wins: {feedback_results['original_wins']}")
+        print(f"  Ties: {feedback_results['ties']}")
+        
+        # Calculate win rates and confidence intervals for feedback evaluation
+        non_tie_total = feedback_results['current_wins'] + feedback_results['original_wins']
+        if non_tie_total > 0:
+            current_win_rate = feedback_results['current_wins'] / non_tie_total
+            original_win_rate = feedback_results['original_wins'] / non_tie_total
+            
+            # 95% confidence intervals using Wilson score interval
+            def wilson_confidence_interval(successes: int, total: int, confidence: float = 0.95) -> Tuple[float, float]:
+                """Calculate Wilson score confidence interval."""
+                if total == 0:
+                    return (0.0, 0.0)
+                
+                z = 1.96 if confidence == 0.95 else 1.645  # 95% or 90% confidence
+                p = successes / total
+                n = total
+                
+                denominator = 1 + (z**2 / n)
+                centre = (p + (z**2 / (2*n))) / denominator
+                margin = z * math.sqrt((p*(1-p) + z**2/(4*n)) / n) / denominator
+                
+                return (max(0.0, centre - margin), min(1.0, centre + margin))
+            
+            current_ci = wilson_confidence_interval(feedback_results['current_wins'], non_tie_total)
+            original_ci = wilson_confidence_interval(feedback_results['original_wins'], non_tie_total)
+            
+            # Statistical significance test - need to import scipy
+            try:
+                from scipy.stats import binomtest
+                binom_result = binomtest(feedback_results['current_wins'], non_tie_total, 0.5)
+                p_value = binom_result.pvalue
+            except ImportError:
+                # Fallback to simple calculation if scipy not available
+                p_value = 1.0 if feedback_results['current_wins'] == feedback_results['original_wins'] else 0.1
+            
+            significant = p_value < 0.05
+        else:
+            current_win_rate = original_win_rate = 0.0
+            current_ci = original_ci = (0.0, 0.0)
+            p_value = 1.0
+            significant = False
+        
+        tie_rate = feedback_results['ties'] / feedback_results['total_evaluations'] if feedback_results['total_evaluations'] > 0 else 0
+        
+        # Prepare final results
+        final_results = {
+            'evaluation_type': 'feedback_comparison',
+            'judge_model': judge_model,
+            'timestamp': datetime.now().isoformat(),
+            'parameters': {
+                'test_conversations': len(test_conversations),
+                'delay': delay
+            },
+            'summary': {
+                'total_evaluations': feedback_results['total_evaluations'],
+                'successful_evaluations': successful_evaluations,
+                'errors': feedback_results['errors'],
+                'success_rate': success_rate,
+                'current_wins': feedback_results['current_wins'],
+                'original_wins': feedback_results['original_wins'],
+                'ties': feedback_results['ties']
+            },
+            'statistics': {
+                'current_win_rate': current_win_rate,
+                'original_win_rate': original_win_rate,
+                'tie_rate': tie_rate,
+                'current_confidence_interval_95': current_ci,
+                'original_confidence_interval_95': original_ci,
+                'non_tie_evaluations': non_tie_total,
+                'statistical_test': {
+                    'test': 'binomial_test',
+                    'null_hypothesis': 'current and original responses are equally good',
+                    'p_value': p_value,
+                    'significant_at_0.05': significant,
+                    'interpretation': f"Current response significantly {'better' if feedback_results['current_wins'] > feedback_results['original_wins'] else 'worse'} than original" if significant else "No significant difference between current and original responses"
+                }
+            },
+            'detailed_results': results
         }
         
         return final_results
@@ -535,23 +840,48 @@ class ModelEvaluator:
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(description='Evaluate models using LM-as-judge paradigm')
-    parser.add_argument('--model1', '-m1', required=True,
-                       help='First model to evaluate')
-    parser.add_argument('--model2', '-m2', required=True,
-                       help='Second model to evaluate')
-    parser.add_argument('--judge', '-j', required=True,
-                       help='Judge model for comparison')
-    parser.add_argument('--conversations', '-c', 
-                       default='data/filtered_conversations.json',
-                       help='Path to conversations file (default: data/filtered_conversations.json)')
-    parser.add_argument('--test-size', '-n', type=int, default=1000,
-                       help='Number of conversations to use for testing (default: 1000)')
-    parser.add_argument('--delay', '-d', type=float, default=0.5,
-                       help='Delay between API calls in seconds (default: 0.5)')
-    parser.add_argument('--output', '-o',
-                       help='Output file path (default: auto-generated in results/)')
+    
+    # Add mode selection
+    subparsers = parser.add_subparsers(dest='mode', help='Evaluation mode')
+    
+    # Model comparison mode (original functionality)
+    model_parser = subparsers.add_parser('compare', help='Compare two models')
+    model_parser.add_argument('--model1', '-m1', required=True,
+                             help='First model to evaluate')
+    model_parser.add_argument('--model2', '-m2', required=True,
+                             help='Second model to evaluate')
+    model_parser.add_argument('--judge', '-j', required=True,
+                             help='Judge model for comparison')
+    model_parser.add_argument('--conversations', '-c', 
+                             default='data/filtered_conversations.json',
+                             help='Path to conversations file (default: data/filtered_conversations.json)')
+    model_parser.add_argument('--test-size', '-n', type=int, default=1000,
+                             help='Number of conversations to use for testing (default: 1000)')
+    model_parser.add_argument('--delay', '-d', type=float, default=0.5,
+                             help='Delay between API calls in seconds (default: 0.5)')
+    model_parser.add_argument('--output', '-o',
+                             help='Output file path (default: auto-generated in results/)')
+    
+    # Feedback comparison mode (new functionality)
+    feedback_parser = subparsers.add_parser('feedback', help='Compare current vs original responses in feedback dataset')
+    feedback_parser.add_argument('--dataset', '-d', required=True,
+                                help='Path to feedback dataset file (e.g., data/feedback_10k_8b.json)')
+    feedback_parser.add_argument('--judge', '-j', required=True,
+                                help='Judge model for comparison')
+    feedback_parser.add_argument('--limit', '-l', type=int,
+                                help='Maximum number of conversations to evaluate (optional)')
+    feedback_parser.add_argument('--delay', type=float, default=0.5,
+                                help='Delay between API calls in seconds (default: 0.5)')
+    feedback_parser.add_argument('--output', '-o',
+                                help='Output file path (default: auto-generated in results/)')
     
     args = parser.parse_args()
+    
+    # Check if mode was specified
+    if not args.mode:
+        parser.print_help()
+        print("\nError: Please specify evaluation mode (compare or feedback)")
+        return 1
     
     # Check API key
     if not os.getenv('TOGETHER_API_KEY'):
@@ -562,50 +892,89 @@ def main():
     # Create results directory
     os.makedirs('results', exist_ok=True)
     
-    # Generate output filename if not provided
-    if not args.output:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model1_short = args.model1.split('/')[-1].replace('-', '_')
-        model2_short = args.model2.split('/')[-1].replace('-', '_')
-        args.output = f"results/evaluation_{model1_short}_vs_{model2_short}_{timestamp}.json"
-    
     try:
         # Initialize evaluator
         evaluator = ModelEvaluator()
+        results = None
         
-        # Load test set
-        test_conversations = evaluator.load_test_set(args.conversations, args.test_size)
-        
-        if not test_conversations:
-            print("Error: No valid conversations found for testing")
-            return 1
-        
-        # Run evaluation
-        results = evaluator.run_evaluation(
-            test_conversations, 
-            args.model1, 
-            args.model2, 
-            args.judge,
-            args.delay
-        )
+        if args.mode == 'compare':
+            # Original model comparison mode
+            # Generate output filename if not provided
+            if not args.output:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                model1_short = args.model1.split('/')[-1].replace('-', '_')
+                model2_short = args.model2.split('/')[-1].replace('-', '_')
+                args.output = f"results/evaluation_{model1_short}_vs_{model2_short}_{timestamp}.json"
+            
+            # Load test set
+            test_conversations = evaluator.load_test_set(args.conversations, args.test_size)
+            
+            if not test_conversations:
+                print("Error: No valid conversations found for testing")
+                return 1
+            
+            # Run evaluation
+            results = evaluator.run_evaluation(
+                test_conversations, 
+                args.model1, 
+                args.model2, 
+                args.judge,
+                args.delay
+            )
+            
+            # Print summary for model comparison
+            print(f"\n=== Model Comparison Evaluation Complete ===")
+            print(f"Results saved to: {args.output}")
+            print(f"\nSummary:")
+            print(f"  {args.model1}: {results['summary']['model1_wins']} wins ({results['statistics']['model1_win_rate']:.1%})")
+            print(f"  {args.model2}: {results['summary']['model2_wins']} wins ({results['statistics']['model2_win_rate']:.1%})")
+            print(f"  Ties: {results['summary']['ties']} ({results['statistics']['tie_rate']:.1%})")
+            print(f"  Success rate: {results['summary']['success_rate']:.1%}")
+            
+            stats_info = results['statistics']['statistical_test']
+            print(f"\nStatistical test: {stats_info['interpretation']}")
+            print(f"  P-value: {stats_info['p_value']:.4f}")
+            print(f"  Significant: {stats_info['significant_at_0.05']}")
+            
+        elif args.mode == 'feedback':
+            # New feedback comparison mode
+            # Generate output filename if not provided
+            if not args.output:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                dataset_name = os.path.splitext(os.path.basename(args.dataset))[0]
+                args.output = f"results/feedback_evaluation_{dataset_name}_{timestamp}.json"
+            
+            # Load feedback dataset
+            test_conversations = evaluator.load_feedback_dataset(args.dataset, args.limit)
+            
+            if not test_conversations:
+                print("Error: No valid conversations found for testing")
+                return 1
+            
+            # Run feedback evaluation
+            results = evaluator.run_feedback_evaluation(
+                test_conversations,
+                args.judge,
+                args.delay
+            )
+            
+            # Print summary for feedback comparison
+            print(f"\n=== Feedback Evaluation Complete ===")
+            print(f"Results saved to: {args.output}")
+            print(f"\nSummary:")
+            print(f"  Current responses: {results['summary']['current_wins']} wins ({results['statistics']['current_win_rate']:.1%})")
+            print(f"  Original responses: {results['summary']['original_wins']} wins ({results['statistics']['original_win_rate']:.1%})")
+            print(f"  Ties: {results['summary']['ties']} ({results['statistics']['tie_rate']:.1%})")
+            print(f"  Success rate: {results['summary']['success_rate']:.1%}")
+            
+            stats_info = results['statistics']['statistical_test']
+            print(f"\nStatistical test: {stats_info['interpretation']}")
+            print(f"  P-value: {stats_info['p_value']:.4f}")
+            print(f"  Significant: {stats_info['significant_at_0.05']}")
         
         # Save results
         with open(args.output, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False, default=str)
-        
-        # Print summary
-        print(f"\n=== Evaluation Complete ===")
-        print(f"Results saved to: {args.output}")
-        print(f"\nSummary:")
-        print(f"  {args.model1}: {results['summary']['model1_wins']} wins ({results['statistics']['model1_win_rate']:.1%})")
-        print(f"  {args.model2}: {results['summary']['model2_wins']} wins ({results['statistics']['model2_win_rate']:.1%})")
-        print(f"  Ties: {results['summary']['ties']} ({results['statistics']['tie_rate']:.1%})")
-        print(f"  Success rate: {results['summary']['success_rate']:.1%}")
-        
-        stats_info = results['statistics']['statistical_test']
-        print(f"\nStatistical test: {stats_info['interpretation']}")
-        print(f"  P-value: {stats_info['p_value']:.4f}")
-        print(f"  Significant: {stats_info['significant_at_0.05']}")
         
         return 0
         
