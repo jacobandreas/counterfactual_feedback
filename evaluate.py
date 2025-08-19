@@ -207,7 +207,7 @@ class ModelEvaluator:
             
             # Split on common dialog turn indicators and take only the first part
             # Include both ChatML-style and other common chat template markers
-            stop_markers = ["\nUser:", "\nAssistant:", "\n<|user|>", "\n<|assistant|>", "\n\n"]
+            stop_markers = ["\nUser:", "\nAssistant:", "\n<|user|>", "\n<|assistant|>", "User:", "Assistant:"]
             for marker in stop_markers:
                 if marker in response:
                     response = response.split(marker)[0].strip()

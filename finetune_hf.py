@@ -215,27 +215,59 @@ class HFFineTuner:
                     self.stats['skipped_conversations'] += 1
                     continue
                 
-                # Build the conversation text up to but not including the last assistant response
-                context_text = ""
-                target_text = ""
+                # Build context conversation using chat template
+                context_messages = conversation_context[:last_assistant_idx]
+                target_response = conversation_context[last_assistant_idx]['content']
                 
-                for i, turn in enumerate(conversation_context):
-                    role = turn['role']
-                    content = turn['content']
-                    
-                    if i < last_assistant_idx:
-                        # This is context (will be masked)
+                # Create the full conversation including the assistant response for tokenization
+                full_messages = context_messages + [{"role": "assistant", "content": target_response}]
+                
+                # Use chat template if available, otherwise fall back to manual formatting
+                if hasattr(self.tokenizer, 'apply_chat_template') and self.tokenizer.chat_template is not None:
+                    try:
+                        # Get context formatted with chat template (up to but not including assistant response)
+                        if context_messages:
+                            context_text = self.tokenizer.apply_chat_template(
+                                context_messages, 
+                                tokenize=False, 
+                                add_generation_prompt=True
+                            )
+                        else:
+                            context_text = self.tokenizer.apply_chat_template(
+                                [], 
+                                tokenize=False, 
+                                add_generation_prompt=True
+                            )
+                        
+                        # Get full conversation formatted with chat template
+                        full_text = self.tokenizer.apply_chat_template(
+                            full_messages, 
+                            tokenize=False, 
+                            add_generation_prompt=False
+                        )
+                    except Exception as e:
+                        print(f"Warning: Chat template failed, falling back to manual formatting: {e}")
+                        # Fall back to manual formatting
+                        context_text = ""
+                        for turn in context_messages:
+                            role, content = turn['role'], turn['content']
+                            if role == 'user':
+                                context_text += f"<|user|>\n{content}\n\n"
+                            elif role == 'assistant':
+                                context_text += f"<|assistant|>\n{content}\n\n"
+                        context_text += f"<|assistant|>\n"
+                        full_text = context_text + f"{target_response}\n\n<|user|>"
+                else:
+                    # Fall back to manual formatting if no chat template
+                    context_text = ""
+                    for turn in context_messages:
+                        role, content = turn['role'], turn['content']
                         if role == 'user':
                             context_text += f"<|user|>\n{content}\n\n"
                         elif role == 'assistant':
                             context_text += f"<|assistant|>\n{content}\n\n"
-                    elif i == last_assistant_idx:
-                        # This is the target assistant response (will be trained on)
-                        context_text += f"<|assistant|>\n"
-                        target_text = f"{content}\n\n<|user|>"
-                
-                # Combine context and target
-                full_text = context_text + target_text
+                    context_text += f"<|assistant|>\n"
+                    full_text = context_text + f"{target_response}\n\n<|user|>"
                 
                 # Tokenize the full conversation
                 full_tokens = self.tokenizer(
@@ -259,9 +291,16 @@ class HFFineTuner:
                 context_length = len(context_tokens['input_ids'])
                 
                 # Only train on the target tokens (after context)
+                # Account for the fact that context_length might be >= full tokens length 
+                # if the target response was truncated
                 if context_length < len(full_tokens['input_ids']):
                     for i in range(context_length, len(full_tokens['input_ids'])):
                         labels[i] = full_tokens['input_ids'][i]
+                elif context_length == len(full_tokens['input_ids']):
+                    # If context tokens equal full tokens, we have no target to train on
+                    # This can happen if the conversation was truncated exactly at the context boundary
+                    self.stats['skipped_conversations'] += 1
+                    continue
                 
                 # Skip if no target tokens to train on
                 training_token_count = len([l for l in labels if l != -100])
