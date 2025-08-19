@@ -232,7 +232,7 @@ class HFFineTuner:
                     elif i == last_assistant_idx:
                         # This is the target assistant response (will be trained on)
                         context_text += f"<|assistant|>\n"
-                        target_text = f"{content}\n\n"
+                        target_text = f"{content}\n\n<|user|>"
                 
                 # Combine context and target
                 full_text = context_text + target_text

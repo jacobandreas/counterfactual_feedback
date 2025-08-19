@@ -203,9 +203,11 @@ class ModelEvaluator:
             # Clean up the response - stop at first occurrence of dialog markers
             response = response.strip()
             
+            print("# Unprocessed output", response.replace("\n", "\\n"))
+            
             # Split on common dialog turn indicators and take only the first part
             # Include both ChatML-style and other common chat template markers
-            stop_markers = ["\nUser:", "\nAssistant:", "\n<|user|>", "\n<|assistant|>"]
+            stop_markers = ["\nUser:", "\nAssistant:", "\n<|user|>", "\n<|assistant|>", "\n\n"]
             for marker in stop_markers:
                 if marker in response:
                     response = response.split(marker)[0].strip()
@@ -445,7 +447,9 @@ class ModelEvaluator:
     "comparing the responses and provide a short explanation. Avoid any position biases and ensure that the order in which the responses were "
     "presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names "
     "of the assistants. Be as objective as possible. After providing your explanation, output your final verdict by strictly following this format: "
-    '"[[A]]" if assistant A is best, "[[B]]" if assistant B is best, or "[[TIE]]" if both assistants are equally good. Your response should be no longer than about 50 words.\n'
+    '"[[A]]" if assistant A is best, "[[B]]" if assistant B is best, or "[[TIE]]" if both assistants are equally good. Don\'t be afraid to use the '
+    "[[TIE]] option; choose a specific model only if there is a meaningful difference in response quality. Your response should be no longer than "
+    "about 50 words.\n"
     f"\nConversation Context:\n{context_text}\n"
     f"Response A: {response1}\n"
     f"Response B: {response2}\n"
@@ -530,17 +534,18 @@ class ModelEvaluator:
                 'error': 'Empty context after removing last two turns (assistant response + user feedback)'
             }
 
-        #print("\n\n\n\n\n\n\n")
-        #print(context)
+        print("\n\n\n\n\n\n\n")
+        print("#")
+        print("# Context:", context)
         
         # Generate responses from both models
         #print(f"  Generating response from {model1}...")
         response1 = self.generate_model_response(model1, context)
-        #print(response1)
+        print("# Response1:", response1.replace("\n", "\\n"))
         
         #print(f"  Generating response from {model2}...")
         response2 = self.generate_model_response(model2, context)
-        #print(response2)
+        print("# Response2:", response2.replace("\n", "\\n"))
         
         if response1 is None or response2 is None:
             return {
@@ -585,7 +590,7 @@ class ModelEvaluator:
         else:  # TIE
             winner = "tie"
 
-        #print("Judge picks model:", winner)
+        print("# Winner:", winner)
         
         return {
             'conversation_id': conversation.get('conversation_id', f'conv_{conv_idx}'),
